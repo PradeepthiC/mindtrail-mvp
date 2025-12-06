@@ -1,57 +1,137 @@
+// src/app/api/reflect/route.ts
 import { NextRequest, NextResponse } from "next/server";
-import OpenAI from "openai";
-import { getApps, initializeApp, applicationDefault, cert } from "firebase-admin/app";
-import { getAuth } from "firebase-admin/auth";
-import { getFirestore } from "firebase-admin/firestore";
+import { logger } from "@/lib/oe/logging/logger";
+import {
+  getOrCreateTraceId,
+  startSpan,
+  classifyError,
+} from "@/lib/oe/tracing/tracing";
+import { callOpenAIForReflection } from "@/lib/oe/openai/client";
+import { adminDb } from "@/lib/firebaseAdmin";
 
-function ensureAdmin() {
-  if (!getApps().length) {
-    const cred = process.env.FIREBASE_SERVICE_ACCOUNT_JSON
-      ? cert(JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT_JSON))
-      : applicationDefault();
-    initializeApp({ credential: cred, projectId: process.env.NEXT_PUBLIC_FIREBASE_PROJECT_ID });
-  }
-}
+type Reflection = {
+  text_raw: string;
+  insight: string;
+  topics: string[];
+  created_at: number;
+};
 
 export async function POST(req: NextRequest) {
-  try {
-    ensureAdmin();
-    const idToken = req.headers.get("Authorization")?.replace("Bearer ", "");
-    if (!idToken) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+  const route = "/api/reflect";
+  const traceId = getOrCreateTraceId(req.headers.get("x-trace-id"));
+  const span = startSpan({ name: "reflect_request", route, traceId });
+  const startedAt = Date.now();
 
-    const decoded = await getAuth().verifyIdToken(idToken);
-    const { text } = await req.json();
-    if (!text || text.trim().length < 5) {
-      return NextResponse.json({ error: "Add a bit more detail." }, { status: 400 });
+  try {
+    const body = await req.json().catch(() => null);
+    const text_raw = (body?.text ?? "").trim();
+
+    if (!text_raw) {
+      const err = new Error("Reflection text required");
+      const cat = classifyError(err);
+
+      span.end({ error: true, error_category: cat });
+
+      logger.warn("reflect_validation_error", {
+        route,
+        traceId,
+        error_category: cat,
+        error_message: err.message,
+      });
+
+      return NextResponse.json(
+        { error: "Reflection text is required" },
+        { status: 400 }
+      );
     }
 
-    const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY! });
-    const prompt = `You are a concise learning coach. Summarize the user's note into a single actionable insight (<= 40 words) and 1-3 short topics.
-Return strict JSON: { "insight": "...", "topics": ["t1","t2"] }.
+    const raw = req.headers.get("x-user-id");
+    const uid =
+      raw && raw !== "null" && raw !== "undefined"
+        ? raw
+        : "anon"; // fallback for dev
 
-User note:
-${text}`;
-
-    const resp = await openai.chat.completions.create({
-      model: "gpt-4o-mini",
-      messages: [{ role: "user", content: prompt }],
-      temperature: 0.2,
-      max_tokens: 160,
-      response_format: { type: "json_object" } as any,
+    // 1) Call OpenAI
+    const { content } = await callOpenAIForReflection(text_raw, {
+      traceId,
+      uid,
+      route,
     });
 
-    const parsed = JSON.parse(resp.choices[0].message.content || "{}");
-    const insight = parsed.insight || "";
-    const topics = Array.isArray(parsed.topics) ? parsed.topics.slice(0,3) : [];
+    const data: Reflection = {
+      text_raw,
+      insight: content,
+      topics: [],
+      created_at: Date.now(),
+    };
 
-    const db = getFirestore();
-    await db.collection("users").doc(decoded.uid).collection("reflections").add({
-      text_raw: text, insight, topics, created_at: Date.now(),
+    // 2) Firestore write via firebase-admin (bypasses security rules)
+    const userDocRef = adminDb.collection("users").doc(uid);
+    const reflectionsCol = userDocRef.collection("reflections");
+    const docRef = await reflectionsCol.add(data);
+
+    span.end({
+      success: true,
+      uid,
+      doc_id: docRef.id,
+      text_length: text_raw.length,
+      insight_length: content.length,
     });
 
-    return NextResponse.json({ ok: true, insight, topics });
-  } catch (e:any) {
-    console.error(e);
-    return NextResponse.json({ error: e.message || "Server error" }, { status: 500 });
+    logger.info("reflect_success", {
+      route,
+      traceId,
+      uid,
+      doc_id: docRef.id,
+      text_length: text_raw.length,
+      insight_length: content.length,
+      duration_ms: Date.now() - startedAt,
+    });
+
+    return NextResponse.json(
+      {
+        id: docRef.id,
+        insight: content,
+        topics: [],
+        traceId,
+      },
+      { status: 200 }
+    );
+  } catch (err: unknown) {
+    const isError = err instanceof Error;
+    const message = isError ? err.message : "Unknown error";
+    const name = isError ? err.name : "Error";
+    const stack = isError ? err.stack : undefined;
+
+    const cat = classifyError(
+      isError ? err : new Error("Unknown error in /api/reflect")
+    );
+
+    span.end({ error: true, error_category: cat });
+
+    logger.error("reflect_request_error", {
+      route,
+      traceId,
+      status: 500,
+      error_category: cat,
+      errorName: name,
+      errorMessage: message,
+      stack,
+    });
+
+    return new Response(
+      JSON.stringify({
+        error: "Reflect failed",
+        details: message,
+        traceId,
+      }),
+      { status: 500, headers: { "Content-Type": "application/json" } }
+    );
+  } finally {
+    logger.info("reflect_request_completed", {
+      route,
+      traceId,
+      duration_ms: Date.now() - startedAt,
+    });
   }
 }
